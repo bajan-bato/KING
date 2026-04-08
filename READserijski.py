@@ -3,6 +3,7 @@
 
 import os
 import glob
+import re
 import pandas as pd
 from docx import Document
 from docx.shared import Pt
@@ -16,16 +17,25 @@ OUT_DIR = "out"
 EXCEL_FILE = os.path.join(DATA_DIR, "excel.xlsx")
 SERIJSKI_FILE = os.path.join(DATA_DIR, "serijski.xlsx")
 
-# Create output directory if it doesn't exist
+EXCEL_SHEET_NAME = "Sheet1"
+EXCEL_COL_EL = 1
+EXCEL_COL_ID = 2
+EXCEL_COL_CODE = 3
+
+SERIJSKI_SHEET_NAME = "Sheet1"
+SERIJSKI_COL_CODE = 2
+SERIJSKI_COL_SERIJSKI = 5
+
+PAD_CODE_WITH = "00"
+OUTPUT_SUMMARY = "joined_data.xlsx"
+# =========================================================
+
 Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
 
-# ==================== HELPER FUNCTIONS ====================
 def normalize_string(s):
-    """Lowercase and strip whitespace, convert to string."""
     return str(s).strip().lower() if pd.notna(s) else ""
 
 def set_cell_text(cell, text, font_name='Arial', font_size=11):
-    """Set cell text with specified font (Arial, size 11)."""
     cell.text = ''
     paragraph = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph()
     run = paragraph.add_run(str(text) if text is not None else '')
@@ -34,153 +44,176 @@ def set_cell_text(cell, text, font_name='Arial', font_size=11):
     run._element.rPr.rFonts.set(qn('w:eastAsia'), font_name)
 
 def split_and_pair(el_str, code_str):
-    """
-    Split el_str by newline, split code_str by newline, clean each code line
-    by taking the first token before any space, then pair according to rules:
-    - If only one code, pair it with every el.
-    - If multiple codes, pair one-to-one (truncate to shorter list).
-    Returns list of (el, code) tuples.
-    """
-    # Split and clean EL
     el_list = [e.strip() for e in str(el_str).split('\n') if e.strip()]
-    
-    # Split and clean CODE: each line -> first token before whitespace
     raw_codes = [c.strip() for c in str(code_str).split('\n') if c.strip()]
     code_list = []
     for raw in raw_codes:
-        parts = raw.split()  # split by any whitespace
+        parts = raw.split()
         if parts:
-            code_list.append(parts[0])  # take the first token (the actual code)
-    
+            code_list.append(parts[0])
     if not code_list:
         return []
     if len(code_list) == 1:
         code_single = code_list[0]
         return [(el, code_single) for el in el_list]
-    # Multiple codes: one-to-one
     pairs = []
     for i in range(min(len(el_list), len(code_list))):
         pairs.append((el_list[i], code_list[i]))
     return pairs
 
+def extract_el_id_from_docx(docx_path):
+    try:
+        doc = Document(docx_path)
+        full_text = '\n'.join([para.text for para in doc.paragraphs])
+        pattern = r'Evidencijska lista\s+([0-9]+[a-z]?)\s*[-–]\s*([0-9]+)'
+        match = re.search(pattern, full_text, re.IGNORECASE)
+        if match:
+            return match.group(1).strip(), match.group(2).strip()
+    except Exception:
+        pass
+    return None, None
+
 # ==================== 1. READ EXCEL FILES ====================
 try:
-    df_excel = pd.read_excel(EXCEL_FILE, sheet_name="Sheet1", header=None, dtype=str, engine='openpyxl')
+    df_excel = pd.read_excel(EXCEL_FILE, sheet_name=EXCEL_SHEET_NAME, header=None, dtype=str, engine='openpyxl')
 except Exception as e:
     print(f"Error reading {EXCEL_FILE}: {e}")
-    print("Make sure openpyxl is installed: pip install openpyxl")
     exit(1)
 
-# Explode rows: each original row may produce multiple (el, id, code) rows
-exploded_rows = []
+# Store mapping: (EL, ID) -> code, and also EL -> code for rows without ID
+el_id_to_code = {}
+el_to_code = {}   # first code for each EL (used when ID missing)
+
 for idx, row in df_excel.iterrows():
-    # Columns: B -> index 1, C -> index 2, D -> index 3
-    el_raw = row[1] if pd.notna(row[1]) else ""
-    id_raw = row[2] if pd.notna(row[2]) else ""
-    code_raw = row[3] if pd.notna(row[3]) else ""
-
-    if not id_raw:  # column C (ID) must be present
-        continue
-
-    # Get pairs of (el, code)
+    el_raw = row[EXCEL_COL_EL] if pd.notna(row[EXCEL_COL_EL]) else ""
+    id_raw = row[EXCEL_COL_ID] if pd.notna(row[EXCEL_COL_ID]) else ""
+    code_raw = row[EXCEL_COL_CODE] if pd.notna(row[EXCEL_COL_CODE]) else ""
     pairs = split_and_pair(el_raw, code_raw)
     for el, code in pairs:
-        if el and code:
-            exploded_rows.append((normalize_string(el), normalize_string(id_raw), code.strip()))
+        if not el or not code:
+            continue
+        norm_el = normalize_string(el)
+        norm_id = normalize_string(id_raw) if id_raw else None
+        el_id_to_code[(norm_el, norm_id)] = code
+        if norm_el not in el_to_code:
+            el_to_code[norm_el] = code
 
-if not exploded_rows:
-    print("No valid rows after explosion. Check excel.xlsx content.")
-    exit(1)
+print(f"[Loaded]: {len(el_id_to_code)} (EL,ID) entries and {len(el_to_code)} unique ELs from excel.xlsx")
 
-# Read serijski.xlsx – columns C (index 2) and F (index 5)
 try:
-    df_ser = pd.read_excel(SERIJSKI_FILE, sheet_name="Sheet1", header=None, dtype=str, engine='openpyxl')
+    df_ser = pd.read_excel(SERIJSKI_FILE, sheet_name=SERIJSKI_SHEET_NAME, header=None, dtype=str, engine='openpyxl')
 except Exception as e:
-    print(f"Error reading {SERIJSKI_FILE}: {e}")
+    print(f" [ERROR]: reading {SERIJSKI_FILE}: {e}")
     exit(1)
 
-serijski_map = {}  # key = normalized C (with padded zeros), value = list of normalized F
+serijski_map = {}
 for idx, row in df_ser.iterrows():
-    c_val = row[2] if pd.notna(row[2]) else ""
-    f_val = row[5] if pd.notna(row[5]) else ""
+    c_val = row[SERIJSKI_COL_CODE] if pd.notna(row[SERIJSKI_COL_CODE]) else ""
+    f_val = row[SERIJSKI_COL_SERIJSKI] if pd.notna(row[SERIJSKI_COL_SERIJSKI]) else ""
     if c_val and f_val:
         key = normalize_string(c_val)
         serijski_map.setdefault(key, []).append(f_val.strip())
 
-# ==================== 2. PROCESS EACH EXPLODED ROW ====================
-summary_data = []  # for output xlsx (el, id, code, serijski_broj)
+print(f"[Loaded]: {len(serijski_map)} unique code entries from serijski.xlsx")
 
-for el, id_, code in exploded_rows:
-    # Build padded code: add "00" at the beginning
-    padded_code = "00" + code
+# ==================== 2. PROCESS ALL .DOCX FILES ====================
+docx_files = glob.glob(os.path.join(IN_DIR, "*.docx"))
+summary_data = []
+successful_files = set()
+failed = []   # (filename, reason)
+
+for docx_path in docx_files:
+    docx_name = os.path.basename(docx_path)
+    
+    # First try to extract EL and ID from the document content
+    el, id_ = extract_el_id_from_docx(docx_path)
+    if not el or not id_:
+        failed.append((docx_name, "No 'Evidencijska lista' pattern found"))
+        continue
+    
+    norm_el = normalize_string(el)
+    norm_id = normalize_string(id_)
+    
+    # Look up code: first try exact (EL, ID), then fallback to EL only
+    code = None
+    if (norm_el, norm_id) in el_id_to_code:
+        code = el_id_to_code[(norm_el, norm_id)]
+    elif norm_el in el_to_code:
+        code = el_to_code[norm_el]
+        print(f"  → Using EL-only fallback for {norm_el} (ID {norm_id} not in Excel)")
+    else:
+        failed.append((docx_name, f"No Excel row for EL={norm_el}"))
+        continue
+    
+    # Get serial numbers for the code
+    padded_code = PAD_CODE_WITH + code
     normalized_padded = normalize_string(padded_code)
-
-    # Find matching serijski entries
     matching_serijski = serijski_map.get(normalized_padded, [])
-
     if not matching_serijski:
-        print(f"⚠️ No matching serijski for code {code} (padded: {padded_code})")
+        failed.append((docx_name, f"No serijski match for code {code}"))
         continue
+    
+    # Modify document
+    try:
+        doc = Document(docx_path)
+        if len(doc.tables) < 2:
+            failed.append((docx_name, "Document has fewer than 2 tables"))
+            continue
+        second_table = doc.tables[1]
+        header_row = second_table.rows[0]
+        serijski_col_idx = None
+        for idx, cell in enumerate(header_row.cells):
+            if normalize_string(cell.text) == "serijski broj":
+                serijski_col_idx = idx
+                break
+        if serijski_col_idx is None:
+            failed.append((docx_name, "Column 'Serijski broj' not found in second table"))
+            continue
+        
+        num_data_rows = len(second_table.rows) - 1
+        for row_idx in range(num_data_rows):
+            if row_idx < len(matching_serijski):
+                cell = second_table.rows[row_idx + 1].cells[serijski_col_idx]
+                set_cell_text(cell, matching_serijski[row_idx])
+        
+        # Determine output filename: preserve the original group (G1 or G2) from input filename
+        group_match = re.match(r'(G[12])', docx_name, re.IGNORECASE)
+        group = group_match.group(1) if group_match else "G1"
+        out_filename = f"{group} ELO {norm_el}-{norm_id}.docx"
+        out_path = os.path.join(OUT_DIR, out_filename)
+        doc.save(out_path)
+        successful_files.add(docx_name)
+        print(f"[Saved]: {out_path}")
+        
+        for serijski_broj in matching_serijski:
+            summary_data.append({
+                "A": norm_el,
+                "B": norm_id,
+                "C": code,
+                "D": serijski_broj
+            })
+    except Exception as e:
+        failed.append((docx_name, f"Exception: {str(e)}"))
 
-    # ==================== 3. FIND MATCHING .DOCX FILE ====================
-    docx_files = glob.glob(os.path.join(IN_DIR, "*.docx"))
-    matching_docx = None
-    for fpath in docx_files:
-        fname = os.path.basename(fpath).lower()
-        if el in fname and id_ in fname:
-            matching_docx = fpath
-            break
-    if not matching_docx:
-        print(f"⚠️ No .docx file found for el={el}, id={id_}")
-        continue
+# ==================== 3. SUMMARY ====================
+print("\n" + "="*60)
+print("SUMMARY")
+print("="*60)
+print(f"Total .docx files in '{IN_DIR}':   {len(docx_files)}")
+print(f"  [SUCCESS]:        {len(successful_files)}")
+print(f"  [FAILED]:         {len(failed)}")
+print("="*60)
 
-    # ==================== 4. MODIFY THE DOCX ====================
-    doc = Document(matching_docx)
-    tables = doc.tables
-    if len(tables) < 2:
-        print(f"⚠️ File {matching_docx} has less than 2 tables. Skipping.")
-        continue
-    second_table = tables[1]
+if failed:
+    print("\n[FAILED FILES]:")
+    for fname, reason in failed:
+        print(f"  • {fname} -> {reason}")
 
-    # Find column index of "Serijski broj"
-    header_row = second_table.rows[0]
-    serijski_col_idx = None
-    for idx, cell in enumerate(header_row.cells):
-        if normalize_string(cell.text) == "serijski broj":
-            serijski_col_idx = idx
-            break
-    if serijski_col_idx is None:
-        print(f"⚠️ Column 'Serijski broj' not found in second table of {matching_docx}")
-        continue
-
-    # Write serijski brojevi into rows (skip header row)
-    num_data_rows = len(second_table.rows) - 1
-    for row_idx in range(num_data_rows):
-        if row_idx < len(matching_serijski):
-            serijski_value = matching_serijski[row_idx]
-            cell = second_table.rows[row_idx + 1].cells[serijski_col_idx]
-            set_cell_text(cell, serijski_value)
-
-    # Save modified document
-    out_filename = f"G1 ELO {el}-{id_}.docx"
-    out_path = os.path.join(OUT_DIR, out_filename)
-    doc.save(out_path)
-    print(f"✅ Saved: {out_path}")
-
-    # Collect summary data
-    for serijski_broj in matching_serijski:
-        summary_data.append({
-            "A": el,
-            "B": id_,
-            "C": code,
-            "D": serijski_broj
-        })
-
-# ==================== 5. CREATE SUMMARY XLSX ====================
+# ==================== 4. CREATE SUMMARY XLSX ====================
 if summary_data:
     df_summary = pd.DataFrame(summary_data)
-    summary_path = os.path.join(OUT_DIR, "joined_data.xlsx")
+    summary_path = os.path.join(OUT_DIR, OUTPUT_SUMMARY)
     df_summary.to_excel(summary_path, index=False, engine='openpyxl')
-    print(f"📊 Summary saved: {summary_path}")
+    print(f"\n  [SUMMARY]: {summary_path}")
 else:
-    print("No data to write to summary xlsx.")
+    print("\nNo data to write to summary xlsx.")

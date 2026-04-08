@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Sort PDF files from output/ into sort/G1/ and sort/G2/ based on Excel data.
-Excel columns: C = ELU (ELO), D = ID, E = Tip opreme (string to clean).
+Always returns the best matching folder (no cutoff).
+Minimal logging: OK / FAIL / SKIP only.
 """
 
 import os
@@ -10,19 +11,18 @@ import shutil
 import difflib
 import pandas as pd
 
-# ========== CONFIGURATION – ADJUST FOR THIS EXCEL ==========
+# ========== CONFIGURATION ==========
 EXCEL_PATH = "data/excel.xlsx"
-SHEET_NAME = "G1_ plan usluga"   # or 0 if sheet name changes
-SKIP_ROWS = 1                    # skip header row (PPZ | ELU | ID | ...)
-COL_ELO = 2                      # column C (0=A,1=B,2=C) – ELU
-COL_ID = 3                       # column D – ID
-COL_H = 4                        # column E – Tip opreme
+SHEET_NAME = "30.3.G2"
+SKIP_ROWS = 1
+COL_ELO = 1
+COL_ID = 2
+COL_H = 3
 DELIMITERS = ['<br>', '\n', '\r\n', ';']
 STRINGS_TO_REMOVE = ["Multimedijska oprema - "]
 OUTPUT_DIR = "output"
 SORT_BASE = "sort"
-FUZZY_CUTOFF = 0.6               # for folder matching
-# ============================================================
+# ===================================
 
 def clean_cell(value):
     if not isinstance(value, str):
@@ -45,7 +45,6 @@ def load_excel_data(excel_path):
         raw_h = clean_cell(row[COL_H]) if pd.notna(row[COL_H]) else ""
         if not raw_elo and not raw_id and not raw_h:
             continue
-        # Split ELO column if multiple values (e.g., "6a<br>6b")
         elo_list = []
         for delim in DELIMITERS:
             if delim in raw_elo:
@@ -54,7 +53,6 @@ def load_excel_data(excel_path):
                 break
         if not elo_list:
             elo_list = [raw_elo] if raw_elo else []
-        # Clean H
         cleaned_h = raw_h
         for s in STRINGS_TO_REMOVE:
             cleaned_h = cleaned_h.replace(s, "")
@@ -70,12 +68,17 @@ def parse_filename(filename):
     return None, None, None
 
 def find_matching_row(rows, file_elo, file_id):
+    # Exact ID match first
     for elo_list, id_val, cleaned_h in rows:
         if file_elo in elo_list and file_id == id_val:
             return cleaned_h
-    # Fallback: substring for ID
+    # Substring ID match
     for elo_list, id_val, cleaned_h in rows:
         if file_elo in elo_list and (file_id in id_val or id_val in file_id):
+            return cleaned_h
+    # ELO-only fallback (ignore ID)
+    for elo_list, id_val, cleaned_h in rows:
+        if file_elo in elo_list:
             return cleaned_h
     return None
 
@@ -86,28 +89,43 @@ def find_target_folder(cleaned_name, group):
     folders = [f for f in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, f))]
     if not folders:
         return None
-    
+
     def normalize(s):
         s = s.lower()
-        s = re.sub(r'[^\w\s]', ' ', s)  # replace punctuation with space
+        s = re.sub(r'^\d+\.\s*g[12]\s+', '', s)   # remove "1. G1 " prefix
+        s = re.sub(r'[^\w\s]', ' ', s)
         s = re.sub(r'\s+', ' ', s).strip()
         return s
-    
-    norm_target = normalize(cleaned_name)
-    best_match = None
-    best_score = 0
+
+    norm_cleaned = normalize(cleaned_name)
+
+    # FIRST: try substring match (contains) – most reliable
+    best_substring_match = None
     for folder in folders:
         norm_folder = normalize(folder)
-        score = difflib.SequenceMatcher(None, norm_target, norm_folder).ratio()
-        # Bonus if one contains the other
-        if norm_target in norm_folder or norm_folder in norm_target:
-            score = max(score, 0.8)
-        if score > best_score and score >= FUZZY_CUTOFF:
+        if norm_cleaned in norm_folder or norm_folder in norm_cleaned:
+            # If multiple, choose the one with the longer match (or first)
+            if best_substring_match is None:
+                best_substring_match = folder
+            else:
+                # Keep the one where the match is longer (optional)
+                pass
+    if best_substring_match:
+        return os.path.join(base_dir, best_substring_match)
+
+    # SECOND: fallback to fuzzy ratio (only if no substring match)
+    best_match = None
+    best_score = -1
+    for folder in folders:
+        norm_folder = normalize(folder)
+        score = difflib.SequenceMatcher(None, norm_cleaned, norm_folder).ratio()
+        if score > best_score:
             best_score = score
             best_match = folder
     if best_match:
         return os.path.join(base_dir, best_match)
     return None
+
 
 def main():
     if not os.path.exists(EXCEL_PATH):
@@ -118,7 +136,7 @@ def main():
         return
 
     rows = load_excel_data(EXCEL_PATH)
-    print(f"Loaded {len(rows)} rows from Excel (after skipping {SKIP_ROWS} rows)")
+    print(f"Loaded {len(rows)} rows from Excel")
 
     os.makedirs(SORT_BASE, exist_ok=True)
     for g in ["G1", "G2"]:
@@ -130,26 +148,26 @@ def main():
     for filename in files:
         group, file_elo, file_id = parse_filename(filename)
         if group is None:
-            print(f"SKIP  {filename} (pattern mismatch)")
+            print(f"SKIP  {filename}")
             continue
 
         cleaned_h = find_matching_row(rows, file_elo, file_id)
         if cleaned_h is None:
-            print(f"FAIL  {filename} -> no Excel match for ELO={file_elo} ID={file_id}")
+            print(f"FAIL  {filename} (no Excel match)")
             continue
 
         target = find_target_folder(cleaned_h, group)
         if target is None:
-            print(f"FAIL  {filename} -> no folder for '{cleaned_h}' in sort/G{group}/")
+            print(f"FAIL  {filename} (no folder match)")
             continue
 
         src = os.path.join(OUTPUT_DIR, filename)
         dst = os.path.join(target, filename)
         if os.path.exists(dst):
-            print(f"SKIP  {filename} -> already exists")
+            print(f"SKIP  {filename} (already exists)")
         else:
             shutil.copy2(src, dst)
-            print(f"OK    {filename} -> {target}")
+            print(f"OK    {filename} -> {os.path.basename(target)}")
 
     print("\nDone.")
 

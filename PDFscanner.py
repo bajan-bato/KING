@@ -32,13 +32,18 @@ RETRY_DELAY = 5                        # seconds between retries
 
 def compress_image_for_api(image: Image.Image, max_size_kb: int = 900) -> Image.Image:
     """Compress image to stay under API file size limit (1024 KB)."""
+    # Helper to check size of an image saved to a temporary file
+    def get_size_and_cleanup(img, fmt, **save_kwargs):
+        with tempfile.NamedTemporaryFile(suffix=f".{fmt.lower()}", delete=False) as tmp:
+            img.save(tmp.name, format=fmt, **save_kwargs)
+            tmp_path = tmp.name
+        size_kb = os.path.getsize(tmp_path) / 1024
+        os.unlink(tmp_path)
+        return size_kb
+
     # Check current size
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-        image.save(tmp.name, format="PNG")
-        size_kb = os.path.getsize(tmp.name) / 1024
-        os.unlink(tmp.name)
-        if size_kb <= max_size_kb:
-            return image
+    if get_size_and_cleanup(image, "PNG") <= max_size_kb:
+        return image
 
     # Scale down
     scale = 0.9
@@ -46,22 +51,24 @@ def compress_image_for_api(image: Image.Image, max_size_kb: int = 900) -> Image.
     while scale > 0.5:
         new_size = (int(image.width * scale), int(image.height * scale))
         resized = image.resize(new_size, resample_filter)
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            resized.save(tmp.name, format="PNG", optimize=True)
-            size_kb = os.path.getsize(tmp.name) / 1024
-            os.unlink(tmp.name)
-            if size_kb <= max_size_kb:
-                return resized
+        if get_size_and_cleanup(resized, "PNG", optimize=True) <= max_size_kb:
+            return resized
         scale -= 0.1
 
     # Last resort: JPEG with lower quality
+    # We need to keep the file to load it, so we'll save, check size, then load
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
         image.save(tmp.name, format="JPEG", quality=50)
-        size_kb = os.path.getsize(tmp.name) / 1024
-        os.unlink(tmp.name)
-        if size_kb <= max_size_kb:
-            return Image.open(tmp.name).convert("RGB")
-    return image
+        tmp_path = tmp.name
+    size_kb = os.path.getsize(tmp_path) / 1024
+    if size_kb <= max_size_kb:
+        # Load the compressed image before deleting the file
+        compressed_img = Image.open(tmp_path).convert("RGB")
+        os.unlink(tmp_path)
+        return compressed_img
+    else:
+        os.unlink(tmp_path)
+        return image  # fallback to original
 
 def ocr_image_from_api(image: Image.Image) -> str:
     """Send image to OCR.space API with retries and robust error handling."""
