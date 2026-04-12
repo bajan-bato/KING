@@ -12,7 +12,7 @@ import difflib
 import pandas as pd
 
 # ========== CONFIGURATION ==========
-EXCEL_PATH = "data/excel.xlsx"
+EXCEL_PATH = "data/excel2.xlsx"
 SHEET_NAME = "30.3.G2"
 SKIP_ROWS = 1
 COL_ELO = 1
