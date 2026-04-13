@@ -12,12 +12,12 @@ import difflib
 import pandas as pd
 
 # ========== CONFIGURATION ==========
-EXCEL_PATH = "data/excel2.xlsx"
-SHEET_NAME = "30.3.G2"
+EXCEL_PATH = "data/CARNET_G1_G2_plan_v0.15.xlsx"
+SHEET_NAME = "G1_ planiranje"
 SKIP_ROWS = 1
-COL_ELO = 1
-COL_ID = 2
-COL_H = 3
+COL_ELO = 2
+COL_ID = 3
+COL_H = 4
 DELIMITERS = ['<br>', '\n', '\r\n', ';']
 STRINGS_TO_REMOVE = ["Multimedijska oprema - "]
 OUTPUT_DIR = "output"
