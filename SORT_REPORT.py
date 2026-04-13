@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Scan the sort/ folder and generate an Excel report of all PDF files
-with date only (YYYY-MM-DD) and alternating row colors per distinct date.
+with creation date only (YYYY-MM-DD) and alternating row colors per distinct date.
 """
 
 import os
@@ -18,9 +18,11 @@ OUTPUT_EXCEL = "sort_report.xlsx"
 # ===================================
 
 def get_file_date(filepath):
-    """Return modification date as YYYY-MM-DD string."""
-    mtime = os.path.getmtime(filepath)
-    return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
+    """Return creation date as YYYY-MM-DD string (Windows: creation time, Unix: metadata change)."""
+    # On Windows, getctime returns creation time; on Unix it returns metadata change time.
+    # Since user is on Windows, this gives creation date.
+    ctime = os.path.getctime(filepath)
+    return datetime.fromtimestamp(ctime).strftime("%Y-%m-%d")
 
 def main():
     if not os.path.isdir(SORT_BASE):
@@ -44,7 +46,7 @@ def main():
                 "Full Path": full_path,
                 "Group": group,
                 "Category": category,
-                "Date": date_str
+                "Date Created": date_str
             })
 
     if not data:
@@ -52,8 +54,8 @@ def main():
         return
 
     df = pd.DataFrame(data)
-    # Sort by date (oldest first)
-    df = df.sort_values(by="Date")
+    # Sort by creation date (oldest first)
+    df = df.sort_values(by="Date Created")
 
     # Write to Excel with conditional formatting for alternating colors per date
     with pd.ExcelWriter(OUTPUT_EXCEL, engine='openpyxl') as writer:
@@ -62,12 +64,12 @@ def main():
         worksheet = writer.sheets['Sheet1']
 
         # 1. Add a helper column "DateGroup" (hidden) that assigns a number to each unique date
-        distinct_dates = df['Date'].unique()
+        distinct_dates = df['Date Created'].unique()
         date_to_group = {date: i+1 for i, date in enumerate(distinct_dates)}  # 1,2,3,...
-        helper_values = [date_to_group[d] for d in df['Date']]
+        helper_values = [date_to_group[d] for d in df['Date Created']]
 
-        # Insert helper column after the Date column (Date is column E, so helper becomes F)
-        helper_col_idx = df.columns.get_loc('Date') + 2   # +1 for 0‑based, +1 to put after Date
+        # Insert helper column after the Date Created column (Date Created is column E, so helper becomes F)
+        helper_col_idx = df.columns.get_loc('Date Created') + 2   # +1 for 0‑based, +1 to put after Date
         worksheet.insert_cols(helper_col_idx)
         helper_cell = worksheet.cell(row=1, column=helper_col_idx)
         helper_cell.value = "DateGroup"
@@ -80,7 +82,7 @@ def main():
 
         # 3. Apply conditional formatting to the entire data rows (columns A to E)
         helper_letter = openpyxl.utils.get_column_letter(helper_col_idx)
-        last_data_col = openpyxl.utils.get_column_letter(df.columns.get_loc('Date') + 1)  # column E
+        last_data_col = openpyxl.utils.get_column_letter(df.columns.get_loc('Date Created') + 1)  # column E
         last_row = len(df) + 1
         range_str = f"A2:{last_data_col}{last_row}"
 
@@ -95,7 +97,7 @@ def main():
         worksheet.column_dimensions[helper_letter].hidden = True
 
     print(f"Exported {len(df)} PDF files to {OUTPUT_EXCEL}")
-    print("Rows are colored alternately per distinct date (light blue / light orange).")
+    print("Rows are colored alternately per distinct creation date (light blue / light orange).")
 
 if __name__ == "__main__":
     main()
